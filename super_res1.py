@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from PIL import Image
+from torch_geometric.nn import GCNConv, BatchNorm
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv
 from facenet_pytorch import InceptionResnetV1
 import os
 from torch.utils.data import Dataset, DataLoader
@@ -17,11 +17,11 @@ import torch.nn.functional as F
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # Hyperparameters
-dir_path = r"lfw_funneled"
+dir_path = r"lfw\lfw-funneled\lfw_funneled"
 threshold = 0.4
 batch_size = 8
 gcn_in_channels = 3
-gcn_hidden_channels = 32
+gcn_hidden_channels = 128
 gcn_out_channels = 64
 hidden_dim = 128  # For attention fusion
 # num_images_per_folder = 1
@@ -43,7 +43,6 @@ def extract_embeddings(hr_image_tensor, lr_image_tensor):
     
     with torch.no_grad():
         image_embeddings = model(lr_image_tensor)
-        print(f"Individual Image Embeddings: {image_embeddings.shape}")
 
     # Graph Embeddings (MediaPipe + GCN)
     base_options = mp_base_options.BaseOptions(model_asset_path='face_landmarker_v2_with_blendshapes.task')
@@ -68,27 +67,17 @@ def extract_embeddings(hr_image_tensor, lr_image_tensor):
 
         # Detect landmarks and extract graph embeddings
         detection_result = detector.detect(image)
-        # print(f"1. Detection Result: {len(detection_result.face_landmarks)} landmarks detected")
         if detection_result.face_landmarks:
-            # print(f" Mediapipe Detection Result: {len(detection_result.face_landmarks[0])} landmarks detected")
             landmarks, blendshapes, transform_matrix = convert_to_tensor(detection_result)
             graph_data = create_graph_from_landmarks(landmarks, threshold)
             model = GCN(gcn_in_channels, gcn_hidden_channels, gcn_out_channels)
             graph_embeddings = model(graph_data.x, graph_data.edge_index)
-
-            # Debug prints
-            # print(f"Individual Graph Embeddings after Mediapipe Landmarks: {graph_embeddings.shape}")
 
             # Append embeddings to lists
             image_embeddings_list.append(image_embeddings)
             graph_embeddings_list.append(graph_embeddings)
         else:
             print("No face detected!")
-            # Show image using cv2
-            # image = cv2.imread(temp_image_path)
-            # cv2.imshow("Image", image)
-            # cv2.waitKey(0)
-            # cv2.destroyAllWindows()
 
         # Delete the temporary file
         os.remove(temp_image_path)
@@ -96,12 +85,6 @@ def extract_embeddings(hr_image_tensor, lr_image_tensor):
     # Stack embeddings into tensors
     image_embeddings = torch.stack(image_embeddings_list)
     graph_embeddings = torch.stack(graph_embeddings_list)
-
-
-
-    # Debug prints
-    # print(f"Batch Image Embeddings: {image_embeddings.shape}")
-    # print(f"Batch Graph Embeddings: {graph_embeddings.shape}")
 
     image_embeddings = torch.sum(image_embeddings, dim=1, keepdim=True)
     graph_embeddings = torch.sum(graph_embeddings, dim=1, keepdim=True)
@@ -114,9 +97,6 @@ def extract_embeddings(hr_image_tensor, lr_image_tensor):
 
     image_embeddings = (linear_layer_image(image_embeddings)).squeeze()
     graph_embeddings = (linear_layer_graph(graph_embeddings)).squeeze()
-
-    print(f"Image Embeddings: {image_embeddings.shape}")
-    print(f"Graph Embeddings: {graph_embeddings.shape}")
 
     return image_embeddings, graph_embeddings
 
@@ -152,17 +132,32 @@ def create_graph_from_landmarks(landmarks, threshold):
     return data
 
 
-# Define GCN model
 class GCN(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, out_channels)
+        self.bn1 = BatchNorm(hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels*2)
+        self.bn2 = BatchNorm(hidden_channels*2)
+        self.conv3 = GCNConv(hidden_channels*2, hidden_channels*4)
+        self.conv4 = GCNConv(hidden_channels*4, hidden_channels*2)
+        self.conv5 = GCNConv(hidden_channels*2, out_channels)
+        self.bn5 = BatchNorm(out_channels)
+        
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
-        x = torch.relu(x)
+        x = self.bn1(x)
+        x = F.relu(x)
         x = self.conv2(x, edge_index)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.conv3(x, edge_index)
+        x = F.relu(x)
+        x = self.conv4(x, edge_index)
+        x = F.relu(x)
+        x = self.conv5(x, edge_index)
+        x = self.bn5(x)
         return x
 
 
@@ -177,25 +172,21 @@ class AttentionFusionModule(nn.Module):
 
 
     def forward(self, embedding1, embedding2):
-        # print(f"Image Embeddings (Attention Fusion): {embedding1.shape}")
-        # print(f"Graph Embeddings (Attention Fusion): {embedding2.shape}")
         combined_embedding = torch.cat((embedding1, embedding2), dim=1)
         combined_embedding = F.tanh(self.linear1(combined_embedding))
         attention_weights = F.softmax(self.linear2(combined_embedding), dim=1)
         attended_embedding = torch.mul(attention_weights, embedding2)
         fused_embedding = embedding1 + attended_embedding
-        # print(f"Fused Embeddings before reshaping (Attention Fusion): {fused_embedding.shape}")
         fused_embedding = fused_embedding.view(batch_size, 1, 32, 32)
         fused_embedding = self.conv_reshape(fused_embedding)
-        print(f"Fused Embeddings: {fused_embedding.shape}")
 
         return fused_embedding
 
 
 
-class ResidualBlock(nn.Module):
+class ResidualUpsampleBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
-        super(ResidualBlock, self).__init__()
+        super(ResidualUpsampleBlock, self).__init__()
         
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, stride, padding)
@@ -215,23 +206,71 @@ class ResidualBlock(nn.Module):
             out += residual
         out = self.relu(out)
         return out
+    
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(ResidualBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, stride, padding)
+        self.conv_residual = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x):
+        residual = x
+        out = self.conv1(x)
+        out = self.relu(out)
+        out = self.conv2(out)
+        # out = self.conv_transpose(out)
+        if out.shape != residual.shape:
+            residual = self.conv_residual(residual)
+            out += residual
+        else:
+            out += residual
+        out = self.relu(out)
+        return out
+
 
 class SuperResolution(nn.Module):
     def __init__(self, in_channels=3, out_channels=3):
         super(SuperResolution, self).__init__()
+
         
-        self.residual_block1 = ResidualBlock(in_channels, out_channels)
-        self.residual_block2 = ResidualBlock(out_channels, out_channels)
-        self.residual_block3 = ResidualBlock(out_channels, out_channels)
+        self.residual_blockA = ResidualBlock(in_channels=3, out_channels=64)
+        self.residual_blockB = ResidualBlock(in_channels=64, out_channels=128)
+        self.residual_blockC = ResidualBlock(128,256)
+        self.residual_blockD = ResidualBlock(256, 512)
+        self.residual_blockE = ResidualBlock(512, 1024)
+        self.residual_blockF = ResidualBlock(1024, 2048)
+        self.residual_blockG = ResidualBlock(2048, 4096)
+        self.residual_blockH = ResidualBlock(4096, 1024)
+        self.residual_blockI = ResidualBlock(1024, 256)
+        self.residual_blockJ = ResidualBlock(256, 128)
+        self.residual_blockK = ResidualBlock(128, 64)
+        self.residual_blockL = ResidualBlock(64, 3)
+        self.residual_block1 = ResidualUpsampleBlock(in_channels, out_channels)
+        self.residual_block2 = ResidualUpsampleBlock(out_channels, out_channels)
+        self.residual_block3 = ResidualUpsampleBlock(out_channels, out_channels)
         # Add one layer to resize the 256*256 image to 224*224
         self.reshape_layer = nn.Conv2d(in_channels=3, out_channels=3, kernel_size=35, stride=1, padding=1)
         
     def forward(self, x):
-        out = self.residual_block1(x)
+        out = self.residual_blockA(x)
+        out = self.residual_blockB(out)
+        out = self.residual_blockC(out)
+        out = self.residual_blockD(out)
+        out = self.residual_blockE(out)
+        out = self.residual_blockF(out)
+        out = self.residual_blockG(out)
+        out = self.residual_blockH(out)
+        out = self.residual_blockI(out)
+        out = self.residual_blockJ(out)
+        out = self.residual_blockK(out)
+        out = self.residual_blockL(out)
+        out = self.residual_block1(out)
         out = self.residual_block2(out)
         out = self.residual_block3(out)
         out = self.reshape_layer(out)
-        print(f"Super Resolved Image: {out.shape}")
         return out
 
 
@@ -297,22 +336,14 @@ def train(super_resolution_model, attention_fusion, optimizer, data_loader, num_
             graph_embeddings = graph_embeddings.to(device)
             image_embeddings = image_embeddings.to(device)
 
-            # print(f"Image Embeddings (training loop): {image_embeddings.shape}")
-            # print(f"Graph Embeddings (training loop): {graph_embeddings.shape}")
-
-            if(image_embeddings.shape[0] != 8):
+            if(image_embeddings.shape[0] != batch_size):
                 continue
 
             # Attention-based fusion 
             fused_embedding = attention_fusion(image_embeddings, graph_embeddings) 
-            # print(f"Fused Embeddings (training loop): {fused_embedding.shape}")
 
 
             super_resolved_image = super_resolution_model(fused_embedding)
-            # print(f"Super Resolved Image (training loop): {super_resolved_image.shape}")
-
-            print(f"High Res Image Shape (training loop): {high_res_images.shape}")
-            print(f"Super Resolved Image Shape (training loop): {super_resolved_image.shape}")
             # Pixel-wise loss
             pixel_loss = pixel_loss_fn(super_resolved_image, high_res_images)  # Use your high-res images
 
@@ -332,9 +363,10 @@ def train(super_resolution_model, attention_fusion, optimizer, data_loader, num_
             print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(data_loader)}], Loss: {total_loss.item():.4f}")
             print("----------------------------------------------------------------------------------")
             losses.append(total_loss.item())
-        torch.save(super_resolution_model.state_dict(), f'super_res_weights.pt{epoch}')
-        torch.save(attention_fusion.state_dict(), f'attention_fusion_weights.pt{epoch}')
-        torch.save(graph_model.state_dict(), f'graph_model_weights.pt{epoch}')
+            torch.save(super_resolution_model.state_dict(), f'super_res_weights_{epoch}.pt')
+            torch.save(attention_fusion.state_dict(), f'attention_fusion_weights_{epoch}.pt')
+            torch.save(graph_model.state_dict(), f'graph_model_weights_{epoch}.pt')
+
 
 
 # Data loading and model initialization
