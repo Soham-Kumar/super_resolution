@@ -13,13 +13,15 @@ import os
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import torch.nn.functional as F
+import time
+
 
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # Hyperparameters
-dir_path = r"lfw\lfw-funneled\lfw_funneled"
-threshold = 0.4
-batch_size = 8
+dir_path = r"lfw_funneled"
+threshold = 0.05
+batch_size = 32
 gcn_in_channels = 3
 gcn_hidden_channels = 128
 gcn_out_channels = 64
@@ -58,15 +60,14 @@ def extract_embeddings(hr_image_tensor, lr_image_tensor):
         numpy_array = image_tensor.cpu().numpy()
         if numpy_array.dtype == np.float32:
             numpy_array = (numpy_array * 255).astype(np.uint8)
+
         pil_image = Image.fromarray(np.transpose(numpy_array, (1, 2, 0)))
-        temp_image_path = f"temp_image_{i}.jpg"
-        pil_image.save(temp_image_path)
-
-        # Load image as MediaPipe Image object
-        image = mp.Image.create_from_file(temp_image_path)
-
-        # Detect landmarks and extract graph embeddings
+        
+        image = mp.Image(
+            image_format=mp.ImageFormat.SRGB, data=np.asarray(pil_image))
+        
         detection_result = detector.detect(image)
+        # print(detection_result)
         if detection_result.face_landmarks:
             landmarks, blendshapes, transform_matrix = convert_to_tensor(detection_result)
             graph_data = create_graph_from_landmarks(landmarks, threshold)
@@ -78,9 +79,6 @@ def extract_embeddings(hr_image_tensor, lr_image_tensor):
             graph_embeddings_list.append(graph_embeddings)
         else:
             print("No face detected!")
-
-        # Delete the temporary file
-        os.remove(temp_image_path)
 
     # Stack embeddings into tensors
     image_embeddings = torch.stack(image_embeddings_list)
@@ -286,7 +284,7 @@ class AffectNetDataset(Dataset):
             folder_path = os.path.join(root_dir, folder)
             if os.path.isdir(folder_path):
                 for filename in os.listdir(folder_path):
-                    if filename.endswith(".jpg") and image_count <=2000:
+                    if filename.endswith(".jpg") and image_count <=5000:
                         img_path = os.path.join(folder_path, filename)
                         img = Image.open(img_path)
                         if img.size[0] >= high_res_image_size and img.size[1] >= high_res_image_size: 
@@ -326,8 +324,11 @@ def train(super_resolution_model, attention_fusion, optimizer, data_loader, num_
     perceptual_model = InceptionResnetV1(pretrained='vggface2').eval()
     perceptual_model.to(device)
 
+    start_time = time.time()
     for epoch in range(num_epochs):
+        epoch_start = time.time()
         for i, (low_res_images, high_res_images) in enumerate(data_loader):
+            step_start = time.time()
             low_res_images = low_res_images.to(device)
             high_res_images = high_res_images.to(device)
 
@@ -358,14 +359,30 @@ def train(super_resolution_model, attention_fusion, optimizer, data_loader, num_
             total_loss.backward()
             optimizer.step()
 
-        
             print("----------------------------------------------------------------------------------")
             print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(data_loader)}], Loss: {total_loss.item():.4f}")
             print("----------------------------------------------------------------------------------")
             losses.append(total_loss.item())
+            
+            
+
+        # epoch_end = time.time()
+        # print("----------------------------------------------------------------------------------")
+        # print(f"Epoch {epoch + 1} took {epoch_end - epoch_start} seconds")
+        # print(f"Total Time Elapsed: {epoch_end - start_time} seconds")
+        # print("----------------------------------------------------------------------------------")
+        if epoch % 5 == 0:
             torch.save(super_resolution_model.state_dict(), f'super_res_weights_{epoch}.pt')
             torch.save(attention_fusion.state_dict(), f'attention_fusion_weights_{epoch}.pt')
             torch.save(graph_model.state_dict(), f'graph_model_weights_{epoch}.pt')
+            print("----------------------")
+            print("|   Weights saved!   |")
+            print("----------------------")
+        with open('losses.txt', 'a') as f:
+            for loss in losses:
+                f.write(str(loss) + '\n')
+        
+
 
 
 
@@ -386,7 +403,7 @@ attention_fusion.to(device)
 graph_model.to(device)
 
 # Train the model
-train(super_resolution_model, attention_fusion, optimizer, data_loader, num_epochs=5)
+train(super_resolution_model, attention_fusion, optimizer, data_loader, num_epochs=10)
 
 # Save the weights
 torch.save(super_resolution_model.state_dict(), 'super_res_weights.pt')
@@ -395,7 +412,7 @@ torch.save(graph_model.state_dict(), 'graph_model_weights.pt')
 
 
 # Save the list of losses to a file
-with open('losses.txt', 'w') as f:
+with open('losses_final.txt', 'w') as f:
     for loss in losses:
         f.write(str(loss) + '\n')
 f.close()
